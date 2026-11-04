@@ -40,8 +40,8 @@ function toPages(value: unknown): Prisma.InputJsonValue {
 // the client there is more. Worst case per page is now ~0.5 MB.
 const DESIGNS_PAGE_SIZE = 60
 
-async function __canvix_get(req: NextRequest, retried = false): Promise<NextResponse> {
-  try {
+async function __canvix_get(req: NextRequest): Promise<NextResponse> {
+  const listRows = async () => {
     const trash = req.nextUrl.searchParams.get('trash') === '1'
     const cursor = req.nextUrl.searchParams.get('cursor')
     const cursorId = req.nextUrl.searchParams.get('id')
@@ -101,11 +101,14 @@ async function __canvix_get(req: NextRequest, retried = false): Promise<NextResp
           ? { cursor: last.updatedAt.toISOString(), id: last.id }
           : null,
     })
+  }
+  try {
+    return await listRows()
   } catch (error) {
-    if (!retried && !process.env.VITEST && classifyDbError(error) === 'DB_NOT_MIGRATED') {
+    if (!process.env.VITEST && classifyDbError(error) === 'DB_NOT_MIGRATED') {
       try {
         await ensureDatabaseSchema()
-        return await __canvix_get(req, true)
+        return await listRows()
       } catch {
         /* fall through to dbErrorResponse */
       }
