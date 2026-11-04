@@ -1,0 +1,91 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { Prisma } from '@/generated/prisma/client'
+import { db } from '@/lib/db'
+import { resolveDesignAccess, NOT_YOUR_DESIGN } from '@/lib/auth/design-guard'
+import { withLogging } from '@/lib/observability'
+
+// GET /api/designs/[id]/versions — list server-side version snapshots (newest first)
+async function __canvix_get(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const { id } = await params
+    const versions = await db.designVersion.findMany({
+      where: { designId: id },
+      orderBy: { createdAt: 'desc' },
+      take: 30,
+    })
+    return NextResponse.json(
+      versions.map((v) => ({
+        id: v.id,
+        label: v.label,
+        name: v.name,
+        width: v.width,
+        height: v.height,
+        pages: v.pages ?? [],
+        createdAt: v.createdAt.toISOString(),
+        server: true,
+      }))
+    )
+  } catch (error) {
+    console.error('GET /api/designs/[id]/versions failed', error)
+    return NextResponse.json({ error: 'Failed to list versions' }, { status: 500 })
+  }
+}
+
+// POST /api/designs/[id]/versions — save a new version snapshot
+// v0.9: owner-only for owned designs (403 otherwise); ownerless unchanged.
+async function __canvix_post(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const { id } = await params
+    const access = await resolveDesignAccess(req, id)
+    if (!access) return NextResponse.json({ error: 'Design not found' }, { status: 404 })
+    if (!access.canEdit) return NextResponse.json(NOT_YOUR_DESIGN, { status: 403 })
+
+    const body = await req.json()
+
+    const version = await db.designVersion.create({
+      data: {
+        designId: id,
+        label: typeof body.label === 'string' && body.label.trim() ? body.label.trim().slice(0, 120) : 'Version',
+        name: typeof body.name === 'string' ? body.name.slice(0, 120) : 'Untitled design',
+        width: Number.isFinite(body.width) ? Math.round(body.width) : 1080,
+        height: Number.isFinite(body.height) ? Math.round(body.height) : 1080,
+        pages: (body.pages ?? []) as Prisma.InputJsonValue,
+      },
+    })
+
+    // prune: keep the 30 most recent per design
+    const keep = await db.designVersion.findMany({
+      where: { designId: id },
+      orderBy: { createdAt: 'desc' },
+      take: 30,
+      select: { id: true },
+    })
+    if (keep.length === 30) {
+      await db.designVersion.deleteMany({
+        where: { designId: id, id: { notIn: keep.map((k) => k.id) } },
+      })
+    }
+
+    return NextResponse.json(
+      {
+        id: version.id,
+        label: version.label,
+        name: version.name,
+        width: version.width,
+        height: version.height,
+        pages: version.pages ?? [],
+        createdAt: version.createdAt.toISOString(),
+        server: true,
+      },
+      { status: 201 }
+    )
+  } catch (error) {
+    console.error('POST /api/designs/[id]/versions failed', error)
+    return NextResponse.json({ error: 'Failed to save version' }, { status: 500 })
+  }
+}
+
+// v0.12.5 (H7): opt-in request logging wrapper — passthrough
+// unless CANVIX_LOG=requests (see src/lib/observability.ts)
+export const GET = withLogging('GET /api/designs/[id]/versions', __canvix_get)
+export const POST = withLogging('POST /api/designs/[id]/versions', __canvix_post)

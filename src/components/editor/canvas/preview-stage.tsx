@@ -1,0 +1,348 @@
+'use client'
+
+import { useEffect, useRef, useState } from 'react'
+import type Konva from 'konva'
+import { Layer, Rect, Stage } from 'react-konva'
+import type { AudioElement, PageData, VideoElement } from '@/lib/types'
+import { gradientProps } from '@/lib/editor-utils'
+import { animateElementAt, pageAnimationDuration } from '@/lib/animations'
+import { beatEnvelopeAt, beatSourceOf } from '@/lib/media/beat-detect'
+import { PreviewElements } from './element-node'
+
+interface PreviewStageProps {
+  page: PageData
+  designWidth: number
+  designHeight: number
+  /** v0.5: play element animations (preview mode) */
+  animated?: boolean
+  /** reset the timeline (bump = restart) */
+  playKey?: number
+  /** reduce-motion accessibility — jumps to the final state */
+  reduceMotion?: boolean
+}
+
+/**
+ * Renders one page of a design, scaled to fit its parent box. Non-interactive,
+ * clipped to page bounds. When `animated`, runs a rAF timeline that applies
+ * entry animations to the element nodes (never mutates the document).
+ */
+export default function PreviewStage({ page, designWidth, designHeight, animated = true, playKey = 0, reduceMotion = false }: PreviewStageProps) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const layerRef = useRef<Konva.Layer | null>(null)
+  const stageRef = useRef<Konva.Stage | null>(null)
+  const [size, setSize] = useState({ w: 0, h: 0 })
+
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const ro = new ResizeObserver((entries) => {
+      const r = entries[0].contentRect
+      setSize({ w: r.width, h: r.height })
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  const scale = size.w > 0 && size.h > 0 ? Math.min(size.w / designWidth, size.h / designHeight) : 0
+  const offsetX = size.w > 0 ? (size.w - designWidth * scale) / 2 : 0
+  const offsetY = size.h > 0 ? (size.h - designHeight * scale) / 2 : 0
+  // v0.11.1 fix: the Konva Stage only renders once the ResizeObserver has
+  // measured the container (scale > 0), but both playback effects used to
+  // bail on the first run (layerRef still null) and their deps never changed
+  // afterwards — so preview audio/video and entry animations silently
+  // no-op'd depending on a commit-vs-observer race. `stageReady` flips once
+  // the stage mounts and re-runs the effects with the layer present.
+  const stageReady = scale > 0
+
+  const bg = page.background
+  const bgProps =
+    bg.type === 'gradient'
+      ? gradientProps(bg.from, bg.to, bg.angle, designWidth, designHeight)
+      : { fill: bg.color }
+
+  // ── v0.5: element animation playback (rAF timeline over Konva nodes) ──
+  const hasAnimations = animated && page.elements.some((e) => e.animation && e.animation.kind !== 'none')
+  useEffect(() => {
+    const layer = layerRef.current
+    const stage = stageRef.current
+    if (!layer || !stage) return
+    if (!hasAnimations || reduceMotion) {
+      // static: ensure all nodes are at base state
+      resetNodes(layer, page)
+      return
+    }
+
+    const animatable = page.elements.filter((e) => e.animation && e.animation.kind !== 'none')
+    // capture base attrs once per play
+    const bases = new Map<string, { x: number; y: number; opacity: number; rotation: number; scaleX: number; scaleY: number; offsetX: number; offsetY: number }>()
+    for (const el of animatable) {
+      const node = layer.findOne(`#${el.id}`)
+      if (!node) continue
+      bases.set(el.id, {
+        x: node.x(),
+        y: node.y(),
+        opacity: node.opacity(),
+        rotation: node.rotation(),
+        scaleX: node.scaleX(),
+        scaleY: node.scaleY(),
+        offsetX: node.offsetX(),
+        offsetY: node.offsetY(),
+      })
+    }
+
+    const start = performance.now()
+    const total = pageAnimationDuration(page) + 0.1
+    let raf = 0
+    let stopped = false
+
+    const tick = (now: number) => {
+      if (stopped) return
+      const t = Math.min((now - start) / 1000, total)
+      for (const el of animatable) {
+        const node = layer.findOne(`#${el.id}`)
+        const base = bases.get(el.id)
+        if (!node || !base) continue
+        const state = animateElementAt(el, t)
+        node.opacity(base.opacity * state.opacity)
+        node.x(base.x + state.dx)
+        node.y(base.y + state.dy)
+        // scale relative to the node center (keep the base offset trick)
+        node.scaleX(base.scaleX * state.scaleX)
+        node.scaleY(base.scaleY * state.scaleY)
+        // wipe: approximate as a horizontal scale from the anchor edge
+        if (state.reveal < 1) {
+          const reveal = Math.max(0.001, state.reveal)
+          node.scaleX(base.scaleX * reveal)
+          const dir = el.animation?.direction ?? 'left'
+          if (dir === 'left') {
+            node.offsetX(base.offsetX)
+          } else if (dir === 'right') {
+            node.offsetX((el as { width: number }).width)
+            node.x(base.x + (el as { width: number }).width)
+          }
+        } else {
+          node.offsetX(base.offsetX)
+        }
+        if (state.rotation) {
+          node.rotation(base.rotation + state.rotation)
+        }
+      }
+      layer.batchDraw()
+      if (t < total) raf = requestAnimationFrame(tick)
+    }
+    raf = requestAnimationFrame(tick)
+    return () => {
+      stopped = true
+      cancelAnimationFrame(raf)
+      resetNodes(layer, page, bases)
+    }
+  }, [page, hasAnimations, reduceMotion, playKey, designWidth, designHeight, stageReady])
+
+  // ── v0.11: media playback — audio elements, video frames, Beat Sync ──
+  // Presentation/preview is where media plays (the editor canvas always
+  // shows the poster/waveform representation). Audio drives the beat clock:
+  // pulses run only while the beat-source audio is actually playing.
+  useEffect(() => {
+    const layer = layerRef.current
+    if (!layer || !animated) return
+
+    const cleanups: Array<() => void> = []
+    const clamp01 = (v: number) => Math.min(1, Math.max(0, Number.isFinite(v) ? v : 0))
+
+    // 1. audio: play every autoplay audio element; the first one with a
+    //    beat grid becomes the Beat Sync clock
+    let beatAudio: HTMLAudioElement | null = null
+    for (const el of page.elements as PageData['elements']) {
+      if (el.type !== 'audio' || el.visible === false || !el.autoplay) continue
+      const a = el as AudioElement
+      const audio = new Audio(a.src)
+      audio.volume = clamp01(a.volume)
+      audio.loop = a.loop
+      void audio.play().catch(() => { /* autoplay policy — stays silent */ })
+      cleanups.push(() => {
+        audio.pause()
+        audio.removeAttribute('src')
+      })
+      if (!beatAudio && a.beats?.length) beatAudio = audio
+    }
+
+    // 2. video: swap the poster Konva image for a live <video> + redraw
+    const videos: Array<{ v: HTMLVideoElement; node: Konva.Image; prev: CanvasImageSource | undefined; trimStart: number; trimEnd: number; loop: boolean }> = []
+    if (!reduceMotion) {
+      for (const el of page.elements as PageData['elements']) {
+        if (el.type !== 'video' || el.visible === false || !el.autoplay) continue
+        const vd = el as VideoElement
+        // v0.11.1 fix: VideoNode renders a GROUP (poster + play chip + trim
+        // badge) that carries the element id — findOne('#id') returns that
+        // Group, which has no .image(), so the live-frame swap silently
+        // skipped EVERY video. Target the KonvaImage inside the group.
+        const group = layer.findOne<Konva.Group>(`#${vd.id}`)
+        const node = (group?.findOne('Image') as Konva.Image | undefined) ?? undefined
+        if (!node || typeof node.image !== 'function') continue
+        const v = document.createElement('video')
+        v.src = vd.src
+        v.loop = vd.loop
+        v.muted = vd.muted
+        v.volume = clamp01(vd.volume)
+        v.playsInline = true
+        const prev = node.image() as CanvasImageSource | undefined
+        // v0.11.1 fix: the trim seek must happen ONCE. Seeking inside every
+        // `canplay` event self-sustains a loop (seek completes → readyState
+        // transitions → canplay refires → seek back to trimStart…) that
+        // freezes the video at trimStart with play() re-invoked ~130×/s.
+        let didTrimSeek = false
+        const onCanPlay = () => {
+          try {
+            if (!didTrimSeek && vd.trimStart > 0) {
+              didTrimSeek = true
+              v.currentTime = vd.trimStart
+            }
+          } catch {
+            /* seek not ready */
+          }
+          void v.play().catch(() => { /* autoplay policy — poster stays */ })
+        }
+        v.addEventListener('canplay', onCanPlay)
+        node.image(v)
+        videos.push({ v, node, prev, trimStart: vd.trimStart, trimEnd: vd.trimEnd, loop: vd.loop })
+        cleanups.push(() => {
+          v.removeEventListener('canplay', onCanPlay)
+          v.pause()
+          v.removeAttribute('src')
+          v.load()
+          node.image(prev ?? undefined)
+        })
+      }
+    }
+
+    // 3. beat pulses + continuous video redraw
+    const beatTargets = (page.elements as PageData['elements']).filter(
+      (e) => (e.beatPulse ?? 0) > 0 && e.visible !== false,
+    )
+    const beats = beatSourceOf(page)?.beats
+    const bases = new Map<string, { x: number; y: number; scaleX: number; scaleY: number; offsetX: number; offsetY: number }>()
+    for (const el of beatTargets) {
+      const node = layer.findOne(`#${el.id}`)
+      if (!node) continue
+      bases.set(el.id, { x: node.x(), y: node.y(), scaleX: node.scaleX(), scaleY: node.scaleY(), offsetX: node.offsetX(), offsetY: node.offsetY() })
+    }
+
+    const restoreBeatTargets = () => {
+      for (const el of beatTargets) {
+        const node = layer.findOne(`#${el.id}`)
+        const base = bases.get(el.id)
+        if (node && base) {
+          node.x(base.x)
+          node.y(base.y)
+          node.scaleX(base.scaleX)
+          node.scaleY(base.scaleY)
+          node.offsetX(base.offsetX)
+          node.offsetY(base.offsetY)
+        }
+      }
+      layer.batchDraw()
+    }
+
+    if (videos.length > 0 || (beatTargets.length > 0 && beatAudio && beats && !reduceMotion)) {
+      let raf = 0
+      const tick = () => {
+        for (const { v, node, trimStart, trimEnd, loop } of videos) {
+          // v0.11.1: honour the trim window — non-looping pauses at trimEnd,
+          // looping wraps back to trimStart (the native loop attr wraps to 0)
+          if (trimEnd < v.duration && v.currentTime >= trimEnd) {
+            if (loop) {
+              try {
+                v.currentTime = trimStart
+              } catch {
+                /* seek not ready */
+              }
+            } else v.pause()
+          }
+          node.getLayer()?.batchDraw()
+        }
+        if (beatAudio && beats) {
+          const t = beatAudio.currentTime
+          for (const el of beatTargets) {
+            const node = layer.findOne(`#${el.id}`)
+            const base = bases.get(el.id)
+            if (!node || !base) continue
+            const pulse = 1 + (el.beatPulse ?? 0) * 0.12 * beatEnvelopeAt(beats, t)
+            node.scaleX(base.scaleX * pulse)
+            node.scaleY(base.scaleY * pulse)
+            node.x(base.x)
+            node.y(base.y)
+          }
+          layer.batchDraw()
+        }
+        raf = requestAnimationFrame(tick)
+      }
+      raf = requestAnimationFrame(tick)
+      cleanups.push(() => cancelAnimationFrame(raf))
+    }
+
+    return () => {
+      for (const fn of cleanups) fn()
+      restoreBeatTargets()
+    }
+  }, [page, animated, reduceMotion, playKey, stageReady])
+
+  return (
+    <div ref={containerRef} className="w-full h-full overflow-hidden" data-testid="preview-stage">
+      {scale > 0 && (
+        <Stage ref={stageRef} width={size.w} height={size.h}>
+          <Layer listening={false} x={offsetX} y={offsetY} scale={{ x: scale, y: scale }}>
+            <Rect width={designWidth} height={designHeight} {...bgProps} />
+          </Layer>
+          <Layer
+            ref={layerRef}
+            listening={false}
+            x={offsetX}
+            y={offsetY}
+            scale={{ x: scale, y: scale }}
+            clip={{ x: 0, y: 0, width: designWidth, height: designHeight }}
+          >
+            <PreviewElements elements={page.elements} />
+          </Layer>
+          {/* v0.6: embed cards are clickable in preview — open in a new tab */}
+          <Layer x={offsetX} y={offsetY} scale={{ x: scale, y: scale }}>
+            {page.elements
+              .filter((el): el is import('@/lib/types').EmbedElement => el.type === 'embed' && el.visible)
+              .map((el) => (
+                <Rect
+                  key={el.id}
+                  x={el.x}
+                  y={el.y}
+                  width={el.width}
+                  height={el.height}
+                  fill="transparent"
+                  cursor="pointer"
+                  onClick={() => window.open(el.url, '_blank', 'noopener,noreferrer')}
+                  onTap={() => window.open(el.url, '_blank', 'noopener,noreferrer')}
+                />
+              ))}
+          </Layer>
+        </Stage>
+      )}
+    </div>
+  )
+}
+
+function resetNodes(layer: Konva.Layer, page: PageData, bases?: Map<string, { x: number; y: number; opacity: number; rotation: number; scaleX: number; scaleY: number; offsetX: number; offsetY: number }>) {
+  for (const el of page.elements) {
+    if (!el.animation || el.animation.kind === 'none') continue
+    const node = layer.findOne(`#${el.id}`)
+    const base = bases?.get(el.id)
+    if (!node) continue
+    if (base) {
+      node.opacity(base.opacity)
+      node.x(base.x)
+      node.y(base.y)
+      node.rotation(base.rotation)
+      node.scaleX(base.scaleX)
+      node.scaleY(base.scaleY)
+      node.offsetX(base.offsetX)
+      node.offsetY(base.offsetY)
+    }
+  }
+  layer.batchDraw()
+}
