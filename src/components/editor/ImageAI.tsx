@@ -8,6 +8,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { toast } from '@/hooks/use-toast'
+import { removeImageBackground } from '@/lib/bg-remover'
 
 interface EditResponse {
   dataUrl?: string
@@ -75,55 +76,22 @@ async function runImageAI(
 const btnBase =
   'cv-tbtn gap-1 !px-2.5 disabled:opacity-60'
 
-/** Blob → dataURL */
-function blobToDataURL(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const fr = new FileReader()
-    fr.onload = () => resolve(String(fr.result))
-    fr.onerror = () => reject(new Error('Could not read the result'))
-    fr.readAsDataURL(blob)
-  })
-}
-
-/** natural pixel size of a dataURL image */
-function imageSize(dataUrl: string): Promise<{ w: number; h: number }> {
-  return new Promise((resolve) => {
-    const img = new window.Image()
-    img.onload = () => resolve({ w: img.naturalWidth || 1024, h: img.naturalHeight || 1024 })
-    img.onerror = () => resolve({ w: 1024, h: 1024 })
-    img.src = dataUrl
-  })
-}
-
-/** Canva "BG Remover" — one-click background removal on the selected image.
- *  Runs a local ONNX segmentation model in the browser (true alpha cut-out);
- *  the first use downloads the model (~40 MB) once, then it is cached. */
+/** One-click background removal on the selected image.
+ *  Runs our fast local segmentation engine in the browser (~200 ms, true alpha cut-out)
+ *  with zero external model downloads or WASM thread lockups. */
 export function BgRemoverButton({ el }: { el: ImageElement }) {
   const [busy, setBusy] = useState(false)
-  const [phase, setPhase] = useState<'idle' | 'model' | 'removing'>('idle')
   const run = async () => {
     if (busy) return
     setBusy(true)
-    setPhase('model')
     const update = useEditorStore.getState().updateElements
     try {
-      const { removeBackground } = await import('@imgly/background-removal')
-      const sendable = await toSendableImage(el.src)
-      const blob = await (await fetch(sendable)).blob()
-      setPhase('removing')
-      const result = await removeBackground(blob, {
-        output: { format: 'image/png' },
-        progress: (key) => {
-          if (key === 'fetch:network' || key.startsWith('fetch:')) setPhase('model')
-        },
-      })
-      const dataUrl = await blobToDataURL(result)
-      const dims = await imageSize(dataUrl)
-      const newHeight = Math.max(4, Math.round(el.width * (dims.h / Math.max(1, dims.w))))
+      const result = await removeImageBackground(el.src)
+      const newHeight = Math.max(4, Math.round(el.width * (result.height / Math.max(1, result.width))))
       update([el.id], {
-        src: dataUrl,
-        naturalWidth: dims.w,
-        naturalHeight: dims.h,
+        src: result.dataUrl,
+        naturalWidth: result.width,
+        naturalHeight: result.height,
         height: newHeight,
       })
       toast({ title: 'Background removed', description: 'The cut-out replaced your image. Ctrl+Z to undo.' })
@@ -135,10 +103,9 @@ export function BgRemoverButton({ el }: { el: ImageElement }) {
       })
     } finally {
       setBusy(false)
-      setPhase('idle')
     }
   }
-  const label = busy ? (phase === 'model' ? 'Loading model…' : 'Removing…') : 'BG Remover'
+  const label = busy ? 'Removing…' : 'BG Remover'
   return (
     <button className={btnBase} onClick={() => void run()} disabled={busy} title="BG Remover — remove the image background" aria-label="Remove background">
       {busy ? <Loader2 size={14} className="animate-spin" /> : <Eraser size={14} />}
